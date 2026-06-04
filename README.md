@@ -353,6 +353,10 @@ a core built without ENABLE_REGS_DUALPORT.
 | indirect jump (jalr) |    6 |        6 |
 | shift operations     | 4-14 |     4-15 |
 
+The minimum shift CPI applies to immediate shift instructions with a zero shift
+amount. Register-register shifts need the usual second operand read when
+`ENABLE_REGS_DUALPORT` is disabled.
+
 When `ENABLE_MUL` is activated, then a `MUL` instruction will execute
 in 40 cycles and a `MULH[SU|U]` instruction will execute in 72 cycles.
 

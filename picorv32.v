@@ -348,31 +348,38 @@ module picorv32 #(
 
 	// Memory Interface
 
-	reg [1:0] mem_state;
-	reg [1:0] mem_wordsize;
-	reg [31:0] mem_rdata_word;
-	reg [31:0] mem_rdata_q;
-	reg mem_do_prefetch;
-	reg mem_do_rinst;
-	reg mem_do_rdata;
-	reg mem_do_wdata;
+	// 0: idle, 1: read, 2: write, 3: prefetch done
+	reg [1:0] mem_state; // Access state.
+	reg [1:0] mem_wordsize; // Access width.
+	reg [31:0] mem_rdata_word; // Aligned load data.
+	reg [31:0] mem_rdata_q; // Latched read data.
+	// prefetched instr do not decode immediately
+	reg mem_do_prefetch; // Start prefetch.
+	reg mem_do_rinst; // Start instruction read.
+	reg mem_do_rdata; // Start load read.
+	reg mem_do_wdata; // Start store write.
 
-	wire mem_xfer;
-	reg mem_la_secondword, mem_la_firstword_reg, last_mem_valid;
+	wire mem_xfer; // Transfer done.
+	// mem_la_secondword: fetch the second half of 32bit instr
+	reg mem_la_secondword, mem_la_firstword_reg, last_mem_valid; // C-ISA fetch state.
+	// In C-ISA mode, fetch the containing word first when PC points to the high halfword.
 	wire mem_la_firstword = COMPRESSED_ISA && (mem_do_prefetch || mem_do_rinst) && next_pc[1] && !mem_la_secondword;
+	// Keep the first-word decision stable while a memory request is waiting.
 	wire mem_la_firstword_xfer = COMPRESSED_ISA && mem_xfer && (!last_mem_valid ? mem_la_firstword : mem_la_firstword_reg);
 
-	reg prefetched_high_word;
-	reg clear_prefetched_high_word;
-	reg [15:0] mem_16bit_buffer;
+	reg prefetched_high_word; // Cached high halfword.
+	reg clear_prefetched_high_word; // Invalidate cache.
+	reg [15:0] mem_16bit_buffer; // Halfword buffer.
 
-	wire [31:0] mem_rdata_latched_noshuffle;
-	wire [31:0] mem_rdata_latched;
+	wire [31:0] mem_rdata_latched_noshuffle; // Raw latched data.
+	wire [31:0] mem_rdata_latched; // Shuffled fetch data.
 
+	// Reuse a prefetched high halfword instead of issuing a new memory read.
 	wire mem_la_use_prefetched_high_word = COMPRESSED_ISA && mem_la_firstword && prefetched_high_word && !clear_prefetched_high_word;
 	assign mem_xfer = (mem_valid && mem_ready) || (mem_la_use_prefetched_high_word && mem_do_rinst);
 
-	wire mem_busy = |{mem_do_prefetch, mem_do_rinst, mem_do_rdata, mem_do_wdata};
+	wire mem_busy = |{mem_do_prefetch, mem_do_rinst, mem_do_rdata, mem_do_wdata}; // Any request active.
+	// Finish after the required handshake, including C-ISA halfword merge cases.
 	wire mem_done = resetn && ((mem_xfer && |mem_state && (mem_do_rinst || mem_do_rdata || mem_do_wdata)) || (&mem_state && mem_do_rinst)) &&
 			(!mem_la_firstword || (~&mem_rdata_latched[1:0] && mem_xfer));
 
@@ -383,6 +390,7 @@ module picorv32 #(
 
 	assign mem_rdata_latched_noshuffle = (mem_xfer || LATCHED_MEM_RDATA) ? mem_rdata : mem_rdata_q;
 
+	// shuffled rdata for compressed ISA
 	assign mem_rdata_latched = COMPRESSED_ISA && mem_la_use_prefetched_high_word ? {16'bx, mem_16bit_buffer} :
 			COMPRESSED_ISA && mem_la_secondword ? {mem_rdata_latched_noshuffle[15:0], mem_16bit_buffer} :
 			COMPRESSED_ISA && mem_la_firstword ? {16'bx, mem_rdata_latched_noshuffle[31:16]} : mem_rdata_latched_noshuffle;
@@ -394,10 +402,12 @@ module picorv32 #(
 		end else begin
 			if (!last_mem_valid)
 				mem_la_firstword_reg <= mem_la_firstword;
+			// latched mem_valid when mem not ready
 			last_mem_valid <= mem_valid && !mem_ready;
 		end
 	end
 
+	// wordsize case
 	always @* begin
 		(* full_case *)
 		case (mem_wordsize)
@@ -543,6 +553,7 @@ module picorv32 #(
 		end
 	end
 
+	// mem assert
 	always @(posedge clk) begin
 		if (resetn && !trap) begin
 			if (mem_do_prefetch || mem_do_rinst || mem_do_rdata)
