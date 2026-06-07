@@ -363,6 +363,7 @@ module picorv32 #(
 	// mem_la_secondword: fetch the second half of 32bit instr
 	reg mem_la_secondword, mem_la_firstword_reg, last_mem_valid; // C-ISA fetch state.
 	// In C-ISA mode, fetch the containing word first when PC points to the high halfword.
+	// happen when branch/jump/irq/reset
 	wire mem_la_firstword = COMPRESSED_ISA && (mem_do_prefetch || mem_do_rinst) && next_pc[1] && !mem_la_secondword;
 	// Keep the first-word decision stable while a memory request is waiting.
 	wire mem_la_firstword_xfer = COMPRESSED_ISA && mem_xfer && (!last_mem_valid ? mem_la_firstword : mem_la_firstword_reg);
