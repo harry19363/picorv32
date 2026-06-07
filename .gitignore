@@ -38,3 +38,4 @@
 .project
 .settings/
 .library_mapping*
+*.log*
