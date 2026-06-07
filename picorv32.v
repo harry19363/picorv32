@@ -370,7 +370,7 @@ module picorv32 #(
 
 	reg prefetched_high_word; // Cached high halfword.
 	reg clear_prefetched_high_word; // Invalidate cache.
-	reg [15:0] mem_16bit_buffer; // Halfword buffer.
+	reg [15:0] mem_16bit_buffer; // Halfword buffer (high 16 bits) for mem_rdata.
 
 	wire [31:0] mem_rdata_latched_noshuffle; // Raw latched data.
 	wire [31:0] mem_rdata_latched; // Shuffled fetch data.
@@ -444,6 +444,7 @@ module picorv32 #(
 			next_insn_opcode <= COMPRESSED_ISA ? mem_rdata_latched : mem_rdata;
 		end
 
+		// Compressed instr expand
 		if (COMPRESSED_ISA && mem_done && (mem_do_prefetch || mem_do_rinst)) begin
 			case (mem_rdata_latched[1:0])
 				2'b00: begin // Quadrant 0
@@ -585,7 +586,7 @@ module picorv32 #(
 		end else begin
 			if (mem_la_read || mem_la_write) begin
 				mem_addr <= mem_la_addr;
-				mem_wstrb <= mem_la_wstrb & {4{mem_la_write}};
+				mem_wstrb <= mem_la_wstrb & {4{mem_la_write}};  // mem_wstrb=4'b0 -> read
 			end
 			if (mem_la_write) begin
 				mem_wdata <= mem_la_wdata;
