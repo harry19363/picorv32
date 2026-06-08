@@ -4,6 +4,328 @@
 
 ---
 
+## 2026-06-08
+
+### Q9: `mem_do_prefetch` / `mem_do_rinst` / `mem_do_rdata` / `mem_do_wdata` 的含义及触发条件
+
+**问：** `mem_do_prefetch`、`mem_do_rinst`、`mem_do_rdata`、`mem_do_wdata` 的含义分别是什么？这几个信号由哪些条件确定，对应什么情况？
+
+**答：**
+
+这四个信号是 PicoRV32 内存接口的**请求类型寄存器**，声明于 [picorv32.v:357-360](picorv32.v#L357-L360)，每个周期最多只有一个为 1（互斥，[picorv32.v:561-571](picorv32.v#L561-L571)）。生命周期：在各 CPU 状态中被置 1，在 `mem_done` 或 `!resetn` 时统一清零（[picorv32.v:1962-1966](picorv32.v#L1962-L1966)）。
+
+---
+
+#### 1. `mem_do_prefetch` — 预取（投机取指）
+
+**含义**：在当前指令译码阶段，**提前发起下一条指令的取指**，不等流水线真正空闲。预取回的数据暂存在 `mem_rdata_q` 中，不立即译码。
+
+**唯一置 1 处**（[picorv32.v:1586](picorv32.v#L1586)）：
+
+```verilog
+// cpu_state_fetch, decoder_trigger 分支（非 JAL 指令）
+mem_do_rinst <= 0;
+mem_do_prefetch <= !instr_jalr && !instr_retirq;
+```
+
+**触发条件**：当前指令译码完成（`decoder_trigger`），且不是 `JAL`/`JALR`/`RETIRQ`。`JALR` 和 `RETIRQ` 的目标地址取决于寄存器值，不可预测，投机预取无意义。
+
+**核心作用**：实现单周期指令吞吐的关键机制——ALU 类指令在 `cpu_state_exec` 执行的同时，下一条指令的预取已与内存接口握手。当流水线回到 fetch 时，数据早已锁存好。
+
+---
+
+#### 2. `mem_do_rinst` — 指令读取（需求取指）
+
+**含义**：流水线**现在就需要**一条指令。与 `mem_do_prefetch` 的区别：`mem_do_rinst` 取回的指令会被立即送入译码。
+
+**置 1 的多种场景：**
+
+**场景 A — fetch 状态入口（无预取可复用）：**
+
+| 位置 | 条件 | 说明 |
+|---|---|---|
+| [1505](picorv32.v#L1505) | `!decoder_trigger && !do_waitirq` | 默认：没有待译码指令，也未等待中断 |
+| [1522](picorv32.v#L1522) | `irq_state[0]` | 中断发生，跳转到 trap handler |
+| [1566](picorv32.v#L1566) | `instr_waitirq && irq_pending` | WFI 被中断唤醒 |
+| [1581](picorv32.v#L1581) | `instr_jal` | JAL 需要改变 PC，直接发起取指 |
+| [1970](picorv32.v#L1970) | `!resetn` 后 | 复位后第一条取指 |
+
+**场景 B — 流水线各级回到 fetch → 预取升级为需求取指：**
+
+最常见模式（[1660](picorv32.v#L1660), [1734](picorv32.v#L1734), [1762](picorv32.v#L1762), [1812](picorv32.v#L1812), [1821](picorv32.v#L1821), [1846](picorv32.v#L1846)）：
+
+```verilog
+mem_do_rinst <= mem_do_prefetch; // 预取已发起→直接复用；否则发起新取指
+```
+
+**场景 C — Load/Store 进入访存时并行取指：**
+
+| 位置 | 状态转换 | 说明 |
+|---|---|---|
+| [1715](picorv32.v#L1715) | `ld_rs1` → `ldmem` | Load 访存与下一条取指并行 |
+| [1752](picorv32.v#L1752) | `ld_rs2` → `stmem` | Store 访存与下一条取指并行 |
+| [1784](picorv32.v#L1784) | PCPI 立即完成 | 乘法器单周期完成，同时发起取指 |
+
+**场景 D — 分支跳转目标取指：**
+
+| 位置 | 条件 | 说明 |
+|---|---|---|
+| [1832](picorv32.v#L1832) | 分支成立 | `set_mem_do_rinst = 1`，清 `decoder_trigger`，发跳转目标取指 |
+
+---
+
+#### 3. `mem_do_rdata` — Load 数据读取
+
+**含义**：执行 `LB`/`LH`/`LW`/`LBU`/`LHU` 时从内存读取数据。
+
+**置 1 路径**（[picorv32.v:1911](picorv32.v#L1911) → [picorv32.v:1971-1972](picorv32.v#L1971-L1972)）：
+
+```verilog
+// cpu_state_ldmem
+if (!mem_do_prefetch || mem_done) begin  // 等待 mem 空闲
+    if (!mem_do_rdata) begin              // 还未发起 load
+        // 设定 mem_wordsize: sb→2, sh→1, sw→0
+        reg_op1 <= reg_op1 + decoded_imm;
+        set_mem_do_rdata = 1;
+    end
+end
+```
+
+**门控条件** `!mem_do_prefetch || mem_done`：Load 必须等待预取完成（`mem_done`），因为内存接口不能同时进行预取和 load。但如果当前没有预取在进行（`!mem_do_prefetch`），可直接发起。
+
+---
+
+#### 4. `mem_do_wdata` — Store 数据写入
+
+**含义**：执行 `SB`/`SH`/`SW` 时向内存写入数据。
+
+**置 1 路径**（[picorv32.v:1883](picorv32.v#L1883) → [picorv32.v:1973-1974](picorv32.v#L1973-L1974)）：
+
+```verilog
+// cpu_state_stmem
+if (!mem_do_prefetch || mem_done) begin  // 等待 mem 空闲
+    if (!mem_do_wdata) begin              // 还未发起 store
+        // 设定 mem_wordsize: sb→2, sh→1, sw→0
+        reg_op1 <= reg_op1 + decoded_imm;
+        set_mem_do_wdata = 1;
+    end
+end
+```
+
+逻辑与 `mem_do_rdata` 完全对称，同样受 `!mem_do_prefetch || mem_done` 门控。
+
+---
+
+#### 整体关系图
+
+```
+cpu_state_fetch
+  ├─ decoder_trigger?
+  │    ├─ instr_jal  → mem_do_rinst = 1
+  │    └─ others     → mem_do_prefetch = 1 (if !jalr && !retirq)
+  └─ !decoder_trigger → mem_do_rinst = 1 (初始/中断)
+
+流水线各级 (ld_rs1, ld_rs2, exec, shift...)
+  ├─ 回到 fetch: mem_do_rinst <= mem_do_prefetch (预取→需求)
+  └─ Load/Store:   mem_do_rinst <= 1 (访存与取指并行)
+
+cpu_state_stmem → set_mem_do_wdata = 1 } 均受
+cpu_state_ldmem → set_mem_do_rdata = 1  } !mem_do_prefetch||mem_done 门控
+
+mem_done 或 !resetn → 全部清零
+```
+
+**核心设计思想**：`mem_do_prefetch` ↔ `mem_do_rinst` 之间是"**低保真预测 → 按需升级**"关系。预取在上一指令译码时就投机发出；流水线回来时若预取仍在进行，直接升级为需求取指；若已完成，数据已在 `mem_rdata_q` 中零延迟消费。Load/Store 则在这套取指流水线之外，需显式等待内存空闲。
+
+**涉及文件：**
+- [picorv32.v:357-360](picorv32.v#L357-L360) — 四个信号声明
+- [picorv32.v:561-571](picorv32.v#L561-L571) — 互斥断言
+- [picorv32.v:1505-1589](picorv32.v#L1505-L1589) — `cpu_state_fetch` 中的置位逻辑
+- [picorv32.v:1870-1915](picorv32.v#L1870-L1915) — `stmem` / `ldmem` 访存状态
+- [picorv32.v:1962-1974](picorv32.v#L1962-L1974) — 清零与 `set_mem_do_*` 触发
+
+---
+
+### Q8: `mem_rdata_latched` shuffle 的四种情况分别对应什么访存场景？
+
+**问 1：** [picorv32.v:394-396](picorv32.v#L394-L396) 中 `mem_rdata_latched` 赋值的几种情况分别对应哪些场景？比如当前访存地址是 `00` 结尾还是 `10` 结尾，取到的前 16 bit 是单独的指令还是作为 32 bit 指令的一半等。
+
+**问 2（追问）：** 在什么情况下会出现需要取一个 `PC[1:0]=10` 的地址，但是上半个 halfword 又没有预取（即情况 3 `mem_la_firstword`）？
+
+---
+
+#### 答 1：四级优先级的 ternary 链
+
+```verilog
+assign mem_rdata_latched =
+    COMPRESSED_ISA && mem_la_use_prefetched_high_word ? {16'bx, mem_16bit_buffer} :          // 情况1
+    COMPRESSED_ISA && mem_la_secondword ? {mem_rdata_latched_noshuffle[15:0], mem_16bit_buffer} :  // 情况2
+    COMPRESSED_ISA && mem_la_firstword ? {16'bx, mem_rdata_latched_noshuffle[31:16]} :        // 情况3
+    mem_rdata_latched_noshuffle;                                                               // 情况4
+```
+
+**关键控制信号：**
+
+| 信号 | 定义（行号） | 含义 |
+|---|---|---|
+| `mem_la_firstword` | [366](picorv32.v#L366) | `next_pc[1] && !mem_la_secondword` — PC 指向字的**上半字**（地址以 `10` 结尾） |
+| `mem_la_secondword` | [364/614](picorv32.v#L614) | 寄存器，`mem_la_firstword` 之后需要再取一个半字 |
+| `mem_la_use_prefetched_high_word` | [378](picorv32.v#L378) | 可复用之前预取缓存的**上半字**，无需再读内存 |
+| `mem_16bit_buffer` | [372/616](picorv32.v#L616) | 16-bit 缓冲器，暂存第一次读出的 `mem_rdata[31:16]` |
+| `mem_rdata_latched_noshuffle` | [391](picorv32.v#L391) | 传输完成时取 `mem_rdata`，否则保持 `mem_rdata_q` |
+
+**四种情况详解：**
+
+**情况 1** — `mem_la_use_prefetched_high_word`（预取缓存命中）
+
+- 数据：`{16'bx, mem_16bit_buffer}` — 上半字来自缓存，下半字无关
+- 场景：上一条 16-bit 压缩指令位于字的下半字，预取时将同字的上半字（`mem_rdata[31:16]`）缓存进 `mem_16bit_buffer`。PC+2 后进入该上半字，**无需发起新的内存读**，`mem_xfer` 通过 [378](picorv32.v#L378) 直接为真
+
+**情况 2** — `mem_la_secondword`（第二半字拼接）
+
+- 数据：`{mem_rdata_latched_noshuffle[15:0], mem_16bit_buffer}` — 低 16 位来自第二次读，高 16 位来自第一次暂存，做半字 swap
+- 场景：情况 3 拿到的上半字 `bits[1:0] == 2'b11`，说明该半字是 32-bit 指令的上半部分，需再读一次拼接成完整 32-bit 指令
+
+**情况 3** — `mem_la_firstword`（首次取上半字，无预取）
+
+- 数据：`{16'bx, mem_rdata_latched_noshuffle[31:16]}` — 抽取内存字的高 16 位
+- 子场景 A（常见）：`bits[1:0] ≠ 11` → 16-bit 压缩指令，`mem_done` 立即为真
+- 子场景 B：`bits[1:0] == 11` → 转入情况 2
+
+**情况 4** — 默认（字对齐标准读取）
+
+- 数据：`mem_rdata_latched_noshuffle` — 原始 32-bit 数据，不做洗牌
+- 场景：PC 字对齐（`PC[1:0]=00`），或非 C-ISA 模式。一次读获取完整指令
+- 若 `mem_rdata[1:0] ≠ 11`：16-bit 压缩指令在下半字，上半字被预取缓存（[621-623](picorv32.v#L621-L623)）
+- 若 `mem_rdata[1:0] == 11`：完整 32-bit 指令
+
+**PC 对齐与 case 映射：**
+
+```
+PC[1:0] = 00 (字对齐)                PC[1:0] = 10 (上半字)
+─────────────────────                ─────────────────────
+                                     无预取缓存 → 情况3: {16'bx, mem_rdata[31:16]}
+一次32bit读→ 情况4: mem_rdata              │
+    │                                   ├─ bits[1:0]≠11 → 16-bit压缩, 完成
+    ├─ bits[1:0]≠11 → 16-bit压缩       │
+    │   (上半字→ 预取缓存)               └─ bits[1:0]=11 → 转入情况2
+    └─ bits[1:0]=11 → 32-bit指令              │
+                                              ▼
+有预取缓存 → 情况1: {16'bx, mem_16bit_buffer}   第二次读 → 情况2: {新[15:0], 旧[31:16]}
+```
+
+---
+
+#### 答 2：情况 3 出现的两大场景
+
+**预取缓存的建立与销毁：**
+
+- **建立**（[621-623](picorv32.v#L621-L623)）：只有当前取出的下半字是 16-bit 压缩指令（`bits[1:0] ≠ 11`）时，才将同字的上半字缓存
+- **销毁**（[1306-1311](picorv32.v#L1306-L1311)）：`latched_branch || irq_state || !resetn` 时 `clear_prefetched_high_word` 拉高，清零缓存
+
+**场景一：分支/跳转到半字对齐的目标地址（最主要）**
+
+```asm
+    C.ADDI x10, 5        # PC=0x100 (字对齐, 下半字)
+    C.J    target        # PC=0x102 (上半字, 预取命中 → 情况1)
+target:
+    C.LI  x11, 3         # PC=0x206 (上半字, 但地址完全不同!)
+```
+
+执行 `C.J target` 时 `latched_branch=1`，预取缓存被清零。新 PC = `0x206`，`PC[1]=1` 但 `prefetched_high_word=0`，**必须走情况 3**。
+
+**场景二：中断/复位**
+
+`irq_state` 或 `!resetn` 同样清零预取缓存。若 trap handler 入口地址的 bit 1 为 1，则走情况 3。
+
+**为什么顺序执行不会出现情况 3：**
+
+| 当前指令 | PC 变化 | 预取缓存？ | 下一条走哪个 case |
+|---|---|---|---|
+| 16-bit 压缩 @ 下半字 | PC+2 → 上半字 | ✅ `prefetched_high_word=1` | Case 1（预取命中） |
+| 16-bit 压缩 @ 上半字 | PC+2 → 下一字的下半字 | ❌ | Case 4（字对齐） |
+| 32-bit @ 字对齐 | PC+4 → 下一字的下半字 | ❌（`bits[1:0]=11` 时显式清缓存 [625](picorv32.v#L625)） | Case 4（字对齐） |
+
+顺序执行中，上半字要么有预取缓存（Case 1），要么 PC 直接跳到下一字的对齐位置（Case 4）。**情况 3 本质上处理的是控制流变更后，PC 恰好落在某个字上半字的场景。**
+
+**涉及文件：**
+- [picorv32.v:394-396](picorv32.v#L394-L396) — `mem_rdata_latched` 四级 ternary 赋值
+- [picorv32.v:366](picorv32.v#L366) — `mem_la_firstword` 定义
+- [picorv32.v:378](picorv32.v#L378) — `mem_la_use_prefetched_high_word` 定义
+- [picorv32.v:611-629](picorv32.v#L611-L629) — `mem_xfer` 后的状态转移
+- [picorv32.v:1306-1312](picorv32.v#L1306-L1312) — `clear_prefetched_high_word` 逻辑
+
+---
+
+### Q7: RV32 指令集中由 opcode 最低两位决定的四个象限分别表示什么含义？
+
+**问 1：** RV32 指令集中由 opcode 最低两位决定的四个象限分别表示什么含义？
+
+**问 2（追问）：** C.SLLI 为什么是栈指针/寄存器类操作？（此前回答将 C.SLLI 归入"栈指针/寄存器操作"不准确）
+
+---
+
+#### 答 1：四个象限的含义
+
+RISC-V 变长指令编码的核心规则——**只需检查指令的最低两位即可确定指令长度**：
+
+| `instr[1:0]` | 象限 | 含义 |
+|:---:|:---:|---|
+| **00** | Quadrant 0 | **16 位压缩指令** (RVC)，`funct3[15:13]` 进一步细分 |
+| **01** | Quadrant 1 | **16 位压缩指令** (RVC) |
+| **10** | Quadrant 2 | **16 位压缩指令** (RVC) |
+| **11** | Quadrant 3 | **≥32 位标准指令**（RV32 中即 32 位指令） |
+
+**核心规则：**
+- `instr[1:0] ≠ 11`（`00`/`01`/`10`）→ **16 位压缩指令**，按象限和 `funct3` 进一步解码
+- `instr[1:0] = 11` → **至少 32 位**的指令；在 RV64/RV128 中还需检查 `bits[4:2]` 判断是否 >32 位
+
+**PicoRV32 中的实现**（[picorv32.v:904-913](picorv32.v#L904-L913)）：
+
+```verilog
+if (COMPRESSED_ISA && mem_rdata_latched[1:0] != 2'b11) begin
+    compressed_instr <= 1;
+    ...
+    case (mem_rdata_latched[1:0])
+        2'b00: begin // Quadrant 0 → C.ADDI4SPN, C.LW, C.SW 等
+        2'b01: begin // Quadrant 1 → C.ADDI, C.JAL, C.LI, C.LUI 等
+        2'b10: begin // Quadrant 2 → C.SLLI, C.LWSP, C.JR, C.ADD 等
+    endcase
+end
+```
+
+#### 答 2：C.SLLI 的分类纠正
+
+C.SLLI 归入 Quadrant 2 并**不是**因为它属于"栈指针/寄存器操作"——这个说法是错的。C.SLLI 是**移位指令**，与栈指针无关。
+
+**象限是按编码格式（encoding format）划分的，不是按操作语义划分的。** 同一象限内的指令可能在语义上完全不相关。以 Quadrant 2（`bits[1:0]=10`）为例：
+
+| `funct3[15:13]` | 指令 | 编码格式 | 语义类别 |
+|:---:|---|---|---|
+| `000` | **C.SLLI** | CI（立即数） | **移位** |
+| `010` | C.LWSP | CI | 整数加载 (SP 相对) |
+| `100` | C.JR / C.MV / C.ADD | CR（寄存器间） | 寄存器操作 |
+| `110` | C.SWSP | CSS | 整数存储 (SP 相对) |
+
+Quadrant 2 实际混搭了三种格式：CI（加载/移位立即数）、CR（纯寄存器操作）、CSS（SP 相对存储）。C.SLLI 之所以在 Q2，单纯因为它的 CI 格式编码恰好落在了 `bits[1:0]=10` 这片编码空间，与功能无关。
+
+**正确的象限划分逻辑：**
+
+| 象限 | bits[1:0] | 寄存器寻址方式 |
+|:---:|:---:|---|
+| Q0 | `00` | 使用 **3-bit 压缩寄存器**（映射到 x8-x15），主要是访存指令 |
+| Q1 | `01` | 使用 **5-bit 完整寄存器**，主要是立即数算术和控制转移 |
+| Q2 | `10` | 混合 CI/CR/CSS 三种格式，移位+SP加载+SP存储+寄存器操作 |
+| Q3 | `11` | 32 位标准指令（非压缩） |
+
+**象限的本质是编码空间的边界划分，不是语义分组。**
+
+**涉及文件：**
+- [picorv32.v:903-913](picorv32.v#L903-L913) — 压缩指令 detection 与 quadrant 分发
+- [picorv32.v:447-549](picorv32.v#L447-L549) — C-ISA 解压缩块（按象限 case 展开）
+
+---
+
 ## 2026-06-07
 
 ### Q6: picorv32 是否实现了 mulh/mul 微架构融合？编译器如何优化？
