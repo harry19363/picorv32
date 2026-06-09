@@ -4,7 +4,437 @@
 
 ---
 
-## 2026-06-08
+## 2026-06-09
+
+### Q13: C.SLLI 译码为何需要对 `decoded_rs2` 赋值？
+
+**问：** [picorv32.v:1006-1010](picorv32.v#L1006-L1010) 中 C.SLLI 指令的 case 分支，为什么要对 `decoded_rs2` 进行赋值？C.SLLI 的移位量是立即数而非寄存器，为何使用 `decoded_rs2`？
+
+**答：**
+
+**核心原因：`decoded_rs2` 不是"第二源寄存器编号"，而是"指令字中位于 rs2 字段位置的比特值"。对移位立即数指令，该字段承载的是移位量 shamt，而非寄存器索引。**
+
+---
+
+#### RISC-V 指令编码中的字段复用
+
+在 RISC-V I-type 编码格式中，移位立即数指令（SLLI/SRLI/SRAI）的移位量 (shamt) 恰好位于 `[24:20]` 位——即 rs2 字段的位置：
+
+```
+I-type 32-bit 编码（移位指令展开后）:
+  [31:25]=funct7  [24:20]=shamt  [19:15]=rs1  [14:12]=funct3  [11:7]=rd  [6:0]=opcode
+                       ↑
+                  shamt 与 R-type 中 rs2 是同一字段位置
+```
+
+因此 PicoRV32 中 `decoded_rs2` 是**语义多态**的——根据指令类型承载不同的含义：
+
+| 指令类别 | `decoded_rs2` 实际含义 | 下游使用 |
+|---|---|---|
+| R-type (ADD, SUB, SLT...) | 第二源寄存器编号 | `cpuregs[decoded_rs2]` ([line 1371](picorv32.v#L1371)) |
+| **Shift imm (SLLI, SRLI, SRAI)** | **移位量 (shamt)** | `reg_sh <= decoded_rs2` ([line 1727](picorv32.v#L1727)) |
+| Store (SB, SH, SW) | 存储数据源寄存器 (rs2) | `cpuregs[decoded_rs2]` |
+| Branch | 第二比较操作数 (rs2) | `cpuregs[decoded_rs2]` |
+
+---
+
+#### C.SLLI 的赋值逻辑
+
+```verilog
+// picorv32.v:1005-1011
+3'b000: begin // C.SLLI
+    if (!mem_rdata_latched[12]) begin
+        is_alu_reg_imm <= 1;
+        decoded_rd  <= mem_rdata_latched[11:7];
+        decoded_rs1 <= mem_rdata_latched[11:7];
+        decoded_rs2 <= {mem_rdata_latched[12], mem_rdata_latched[6:2]};
+    end
+end
+```
+
+C.SLLI 编码：`[15:13]=000`, `[12]=nzuimm[5]`, `[11:7]=rd/rs1`, `[6:2]=nzuimm[4:0]`
+
+其中 `{mem_rdata_latched[12], mem_rdata_latched[6:2]}` 是 6-bit 拼接，赋给 5-bit 的 `decoded_rs2[4:0]`。Verilog 语义下高位被截断（bit 12 被丢弃）。由于 line 1006 的 `if (!mem_rdata_latched[12])` 已守卫 bit12=0，截断无害。
+
+> **设计意图**：6-bit 拼接反映了 RV64C 编码约定（6-bit shift amount），picorv32 (RV32) 通过截断自然适配到 5-bit。`!mem_rdata_latched[12]` 守卫确保 RV32 合法性（shift amount ≤ 31）。
+
+---
+
+#### 下游使用路径
+
+`decoded_rs2` 在 C.SLLI → SLLI 执行时有两条消耗路径，均将其作为 shift amount 使用：
+
+**路径 A — 无 barrel shifter**（[picorv32.v:1727](picorv32.v#L1727)）：
+```verilog
+reg_sh <= decoded_rs2;          // 移位量存入迭代移位寄存器
+cpu_state <= cpu_state_shift;   // 进入多周期移位状态机
+```
+
+**路径 B — 有 barrel shifter**（[picorv32.v:1735](picorv32.v#L1735)）：
+```verilog
+reg_op2 <= ... decoded_rs2;     // 移位量直连 ALU 第二操作数
+mem_do_rinst <= mem_do_prefetch; // 单周期完成
+```
+
+---
+
+#### 完整数据流
+
+```
+C.SLLI (16-bit compressed)
+  │
+  ├─ C-ISA decode (line 1003-1011): is_alu_reg_imm=1, decoded_rs2=shamt
+  ├─ C-ISA expansion (line 447-549): mem_rdata_q → 32-bit SLLI encoding
+  ├─ Fine decode (line 1082): instr_slli=1
+  │
+  └─ ld_rs1: cpuregs[decoded_rs1] → reg_op1
+       ├─ !BARREL_SHIFTER: reg_sh <= decoded_rs2 → cpu_state_shift (line 1727)
+       └─  BARREL_SHIFTER: reg_op2 <= decoded_rs2 → cpu_state_exec (line 1735)
+```
+
+**结论**：`decoded_rs2` 是"rs2 字段位置的值"，不是"第二寄存器编号"。C.SLLI 对其赋值是提取该字段位置上的移位立即数，用于驱动下游移位器。这是 RISC-V 编码级别的固有设计——移位立即数复用 I-type 中的 rs2 字段位置。
+
+**涉及文件：**
+- [picorv32.v:1005-1011](picorv32.v#L1005-L1011) — C.SLLI decode 与 `decoded_rs2` 赋值
+- [picorv32.v:1722-1728](picorv32.v#L1722-L1728) — `decoded_rs2` 作为 `reg_sh` 移位量的路径 A
+- [picorv32.v:1730-1735](picorv32.v#L1730-L1735) — `decoded_rs2` 作为 `reg_op2` 移位量的路径 B
+- [picorv32.v:1082](picorv32.v#L1082) — `instr_slli` 的最终判定
+
+---
+
+### Q12: `dbg_*` / `q_*` / `cached_*` 信号及 `new_ascii_instr` 的作用与用途
+
+**问：** [picorv32.v:705](picorv32.v#L705) 行开始定义的 `dbg_*` 信号和 `new_ascii_instr`，以及 [picorv32.v:774](picorv32.v#L774) 行开始定义的 `q_*`、`cached_*` 信号的作用分别是什么，用于 RTL 级验证还是芯片实际运行时 debug？
+
+**答：**
+
+所有上述信号均**仅用于 RTL 级验证**（仿真 trace + 形式化验证），不用于芯片运行时 debug（无 JTAG/APB 等硅片 debug 接口），普通综合时被 `ifdef` 裁剪或优化掉。
+
+---
+
+#### 信号分组与数据流
+
+```
+           instr_xxx ──────► new_ascii_instr (combinational)
+                              │
+  decoded_imm, next_insn_opcode, decoded_rd/rs1/rs2
+                              │
+                              ▼
+     ┌─────────── dbg_* 信号组 (FORMAL_KEEP reg) ───────────┐
+     │  dbg_ascii_instr / dbg_insn_opcode / dbg_insn_imm    │
+     │  dbg_insn_rs1/2 / dbg_insn_addr                      │
+     │  dbg_rs1val / dbg_rs2val / dbg_rs1/2val_valid        │
+     │  dbg_ascii_state / dbg_next                          │
+     └──────────────────────┬───────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            ▼               ▼               ▼
+     ┌──────────┐   ┌──────────────┐  ┌─────────────────┐
+     │  q_* reg │   │ cached_* reg │  │ 输出接口         │
+     │1-cycle   │   │C-ISA repeat  │  │ $display(DEBUG/  │
+     │pipeline  │   │exec cache    │  │  DEBUGASM)       │
+     │delay     │   │              │  │ rvfi_* (RISCV_   │
+     └──────────┘   └──────────────┘  │  FORMAL)         │
+                                      └─────────────────┘
+```
+
+---
+
+#### 1. `new_ascii_instr`（[picorv32.v:704](picorv32.v#L704)）
+
+纯组合逻辑，将 `instr_lui`、`instr_add` 等解码标志映射为对应指令的 ASCII 字符串（如 `"lui"`、`"add"`）。仅在仿真中有意义——将指令译码为人类可读助记符，方便 `$display` 输出。
+
+#### 2. `dbg_*` 信号组（[picorv32.v:705-713](picorv32.v#L705-L713), [1198](picorv32.v#L1198), [181](picorv32.v#L181)）
+
+声明为 `FORMAL_KEEP reg`。`FORMAL_KEEP`（[picorv32.v:39](picorv32.v#L39)）仅在 `FORMAL` 或 `DEBUGNETS` 宏定义时才展开为 `(* keep *)`，阻止综合工具优化。普通综合时不定义这些宏，信号被裁掉。
+
+**功能**：聚合当前正在执行的指令的所有关键信息——PC、操作码、源寄存器、立即数、操作数值、当前 CPU 状态名。
+
+**数据来源**：在组合逻辑块（[picorv32.v:823-849](picorv32.v#L823-L849)）中动态选择：
+- **默认**：从 `q_*` 流水寄存器取旧值（保持稳定）
+- **新指令发射**（`dbg_next && decoder_pseudo_trigger_q`）：从 `cached_*` 回放缓存的指令信息
+- **新指令发射**（`dbg_next && !decoder_pseudo_trigger_q`）：从 `new_ascii_instr`、`next_insn_opcode`、`decoded_imm` 等获取最新译码结果
+
+#### 3. `q_*` 信号（[picorv32.v:774-780](picorv32.v#L774-L780)）+ `dbg_next`
+
+一级流水线延迟寄存器（[picorv32.v:792-799](picorv32.v#L792-L799)）：每个时钟周期将 `dbg_*` 的值锁存一拍，形成"先取旧值，有条件时更新"的流水模式。确保 `dbg_*` 在无新指令的周期内保持稳定输出。
+
+#### 4. `cached_*` 信号（[picorv32.v:785-790](picorv32.v#L785-L790)）
+
+当 `decoder_trigger_q` 置位时（[picorv32.v:806-816](picorv32.v#L806-L816)），将译码结果（助记符、立即数、操作码、寄存器编号）缓存。用途：C-ISA 指令重复执行时（如移位指令的 `cpu_state_shift`），`decoder_pseudo_trigger_q` 置位，`dbg_*` 组合逻辑从 `cached_*` 回放，无需重新译码。
+
+#### 两个消费者
+
+| 消费者 | 宏 | 用途 |
+|---|---|---|
+| `$display` trace | `DEBUG` / `DEBUGASM` | 仿真中每条指令发射时打印 PC + 操作码 + 助记符 |
+| `rvfi_*` 输出端口 | `RISCV_FORMAL` | 驱动 RISC-V Formal Interface，供 `riscv-formal` 等工具做等价性/属性验证 |
+
+RVFI 数据映射（[picorv32.v:1996-2009](picorv32.v#L1996-L2009)）：`rvfi_insn <= dbg_insn_opcode`、`rvfi_pc_rdata <= dbg_insn_addr`、`rvfi_rs1_addr <= ... dbg_insn_rs1` 等。
+
+#### 结论
+
+这些信号是**纯 RTL 级验证基础设施**。`FORMAL_KEEP` 和所有消费者均受 `ifdef` 保护，不在硅片中存在。它们服务于两个验证层次——仿真可见性（`$display` trace）和形式化验证（RVFI 接口）。
+
+**涉及文件：**
+- [picorv32.v:39-45](picorv32.v#L39-L45) — `FORMAL_KEEP` 宏定义
+- [picorv32.v:704-713](picorv32.v#L704-L713) — `new_ascii_instr` 与 `dbg_*` 声明
+- [picorv32.v:715-772](picorv32.v#L715-L772) — `new_ascii_instr` 组合赋值
+- [picorv32.v:774-790](picorv32.v#L774-L790) — `q_*`、`cached_*` 声明
+- [picorv32.v:792-816](picorv32.v#L792-L816) — `q_*`/`cached_*` 时序逻辑
+- [picorv32.v:823-849](picorv32.v#L823-L849) — `dbg_*` 组合赋值（三级 MUX）
+- [picorv32.v:853-869](picorv32.v#L853-L869) — `$display` 消费者
+- [picorv32.v:1198-1209](picorv32.v#L1198-L1209) — `dbg_ascii_state`
+- [picorv32.v:1991-2009](picorv32.v#L1991-L2009) — RVFI 消费者
+
+---
+
+### Q11: `mem_xfer` 状态下 line 620 `else` 分支的访存场景分析
+
+**问：** [picorv32.v:620](picorv32.v#L620) 的 `else` 分支对应访存时的哪种情况？即上一条指令为 16-bit 还是 32-bit，对应哪种访存类型，当前 PC 要取的指令对应哪种访存类型？
+
+**答：**
+
+第 620 行 `else` 分支是第 615 行 `if (COMPRESSED_ISA && mem_la_read)` 的补集。在后综合逻辑中，state 1（读等待）下 `mem_xfer` 有效时进入。
+
+#### `mem_la_read` 在 state 1 中的行为
+
+`mem_la_read`（[picorv32.v:388-389](picorv32.v#L388-L389)）的两个 OR 项中，Term 1 要求 `!mem_state`（state 0），在 state 1 时恒为假。所以 state 1 下 `mem_la_read=1` 的唯一可能是 Term 2：
+
+```
+COMPRESSED_ISA && mem_xfer && mem_la_firstword && !mem_la_secondword && &mem_rdata_latched[1:0]
+```
+
+即：C-ISA 模式下，PC 指向上半字（`PC[1]=1`，首次取指），且取到的数据 `bits[1:0]==2'b11`（上半字是 32-bit 指令的上半部分，需再读一次）。
+
+**结论：else 分支 = 所有"不需要再读 secondword"的情况。**
+
+---
+
+#### 四大场景详细分析
+
+##### 场景 A：非 C-ISA 模式（`COMPRESSED_ISA=0`）
+
+| 项目 | 内容 |
+|---|---|
+| 上一条指令 | 32-bit |
+| 本周期访问类型 | `mem_do_rinst` / `mem_do_rdata` / `mem_do_prefetch` |
+| 当前取指类型 | 32-bit，字对齐 |
+| 623-629 行 | 不执行（COMPRESSED_ISA 为假） |
+| 状态转移 | `mem_state <= mem_do_rinst \|\| mem_do_rdata ? 0 : 3` |
+
+##### 场景 B：C-ISA，PC[1:0]=00（字对齐），取到 16-bit 压缩指令（`mem_rdata[1:0]!=11`）
+
+```
+总线读 word_N: [15:0] = 当前指令（16-bit 压缩, bits[1:0]!=11）
+               [31:16] = 同字上半字 = 顺序执行的下一条指令
+```
+
+| 项目 | 内容 |
+|---|---|
+| 上一条指令 | 16-bit 压缩（PC+2 跳至当前地址），或分支/跳转至此 |
+| 本周期访问类型 | 需求取指（rinst）或预取完成（prefetch → state 3） |
+| 当前取指类型 | **16-bit 压缩指令**，位于 word_N 下半字 |
+| 预取缓存 | `prefetched_high_word <= 1`，`mem_16bit_buffer <= mem_rdata[31:16]` |
+| 作用 | 顺序执行 PC+2 进入 word_N 上半字时，复用缓存无需总线读 |
+
+##### 场景 C：C-ISA，PC[1:0]=00（字对齐），取到 32-bit 指令（`mem_rdata[1:0]==11`）
+
+| 项目 | 内容 |
+|---|---|
+| 上一条指令 | 取决于执行流 |
+| 本周期访问类型 | 需求取指或预取 |
+| 当前取指类型 | **32-bit 指令**，完整包含在 word_N 中 |
+| 预取缓存 | `prefetched_high_word <= 0`（清空） |
+| 原因 | 32-bit 指令占满整个 word，PC+4 指向 word_{N+1}，同字上半字不构成独立指令 |
+
+##### 场景 D：C-ISA，PC[1:0]=10（上半字），取到 16-bit 压缩指令
+
+**触发条件**：分支/跳转/中断使 PC 以 `10` 结尾，且上半字 `bits[17:16]!=11`（16-bit 压缩指令）。
+
+```
+mem_la_firstword=1, mem_la_read=0（因 &mem_rdata_latched[1:0] 为假）
+→ 进入 else 分支
+```
+
+| 项目 | 内容 |
+|---|---|
+| 上一条指令 | 分支/跳转指令，已改变 PC |
+| 本周期访问类型 | 需求取指（rinst，分支目标） |
+| 当前取指类型 | **16-bit 压缩指令**，位于 word_N 上半字 |
+| 623-629 行注意点 | `mem_rdata[1:0]` 对应的是**下半字**的 bits（已过时的数据）。此处的缓存更新对顺序执行无直接帮助（PC+2 跳到 word_{N+1}，不依赖本字的缓存） |
+| 此行与 line 615 的分水岭 | 同一地址（PC[1]=1）、同一 `mem_la_firstword=1`，区别见下图 |
+
+```
+PC[1:0]=10 的上半字取指, mem_la_firstword=1
+         │
+         ├─ mem_rdata[17:16] == 2'b11 → 32-bit 指令上半部分 → line 615（需 secondword）
+         │
+         └─ mem_rdata[17:16] != 2'b11 → 16-bit 压缩指令     → else 分支（已完成）
+```
+
+##### 场景 E：C-ISA secondword 完成（两次读取的收尾）
+
+第一次 `mem_xfer` 走了 line 615 分支（置 `mem_la_secondword<=1`），第二次读完成后 `mem_la_secondword=1` 使 `mem_la_read` Term 2 条件 `!mem_la_secondword` 为假 → 进入 else 分支。
+
+```
+第一次 mem_xfer: line 615-619, mem_la_secondword <= 1, mem_valid 保持 1
+                 发起第二次总线读（word_{N+1}）
+第二次 mem_xfer: mem_la_read Term 2 因 !mem_la_secondword=0 为假
+                 → 进入 else 分支
+```
+
+| 项目 | 内容 |
+|---|---|
+| 上一条"指令" | 被拼接为跨字 32-bit 指令 |
+| 本周期访问类型 | secondword 完成 |
+| 当前取指 | 32-bit 指令已完整（由两次读组装） |
+| 623-629 行 | `mem_la_secondword` 在行 624 被读取时**仍为 1**（非阻塞赋值未生效），条件为真 → 缓存 `mem_rdata[31:16]`，`prefetched_high_word<=1` |
+
+---
+
+#### else 分支逻辑拆解
+
+```verilog
+// 行 620-632
+end else begin
+    mem_valid <= 0;                              // ① 关闭总线请求
+    mem_la_secondword <= 0;                      // ② 重置 secondword 状态
+    if (COMPRESSED_ISA && !mem_do_rdata) begin   // ③ C-ISA 指令取指的预取缓存更新
+        if (~&mem_rdata[1:0] || mem_la_secondword)
+            {mem_16bit_buffer, prefetched_high_word} <= {mem_rdata[31:16], 1'b1};
+        else
+            prefetched_high_word <= 0;
+    end
+    mem_state <= mem_do_rinst || mem_do_rdata ? 0 : 3;  // ④ 下一状态
+end
+```
+
+| 步骤 | 作用 |
+|---|---|
+| ① `mem_valid <= 0` | 撤销总线请求，标志本次传输结束 |
+| ② `mem_la_secondword <= 0` | 重置跨字取指状态，为下次做准备 |
+| ③ 缓存更新 | 当本次是 C-ISA 指令取指（非 load）时，判断是否需要缓存上半字供下一条指令预取 |
+| ④ 状态转移 | 需求取指/load 完成 → state 0 idle；纯预取完成 → state 3 prefetch done |
+
+---
+
+#### 与 Q10 的对应关系
+
+| Q10 分析的 `if` 分支 | 本问分析的 `else` 分支 |
+|---|---|
+| `COMPRESSED_ISA && mem_la_read` 为真 | 上述条件为假 |
+| 当前取指被识别为 32-bit 指令的上半部分 | 当前取指已是一次完整的读取 |
+| 需再发起一次总线读（secondword） | 无需再读，直接完成 |
+| 访问类型仅为 C-ISA 上半字 `bits[1:0]==11` | 覆盖所有其他场景（非 C-ISA、字对齐、16-bit 压缩指令、secondword 收尾） |
+
+**涉及文件：**
+- [picorv32.v:613-632](picorv32.v#L613-L632) — state 1 `mem_xfer` 完整 if-else 分支
+- [picorv32.v:388-389](picorv32.v#L388-L389) — `mem_la_read` 定义
+- [picorv32.v:367](picorv32.v#L367) — `mem_la_firstword` 定义
+- [picorv32.v:394-397](picorv32.v#L394-L397) — `mem_rdata_latched` 四级选择
+
+---
+
+### Q10: `mem_xfer` 状态下 line 615-619 分支中 `!mem_la_use_prefetched_high_word` 的场景分析
+
+**问：** 在 state 1 的 `mem_xfer` 分支中（[picorv32.v:613-619](picorv32.v#L613-L619)），`if (COMPRESSED_ISA && mem_la_read)` 进入需要 secondword 的路径。其中 `!mem_la_use_prefetched_high_word`（line 618）的判断对应什么场景？为什么此时可能有 `mem_la_use_prefetched_high_word` 为真的情况？上一条/下一条指令分别可能是什么？
+
+**答：**
+
+该分支的进入条件（由 `mem_la_read` 第二条件推导）：C-ISA 模式下，`mem_xfer` 刚完成，`mem_la_firstword=1`（PC 指向上半字），且刚取到的半字 `bits[1:0] == 2'b11`。即：**首次取上半字发现它是 32-bit 指令的上半部分，需要 secondword 拼接**。
+
+在此分支内，line 618 `if (!mem_la_use_prefetched_high_word)` 区分了两种子场景：
+
+---
+
+#### 子场景 A：`mem_la_use_prefetched_high_word = 0` → 执行 line 619
+
+**数据来源**：真实的总线读取（mem_rdata_latched Case 3），`mem_rdata[31:16]` 是本周期刚通过 `mem_valid && mem_ready` 握手拿到的新鲜数据。**必须保存到 `mem_16bit_buffer`**，供第二次读完成后拼接。
+
+**触发条件**：跳转/分支到 halfword 对齐的地址，且该地址恰好落在 32-bit 指令的中间（`PC[1]=1`，对应半字 `bits[1:0]==11`）。`clear_prefetched_high_word` 已将旧缓存清零，无预取可用。
+
+```
+上一条: 分支/跳转/中断 → PC 被改变，clear_prefetched_high_word 清零缓存
+当前PC: word 的上半字（PC[1]=1），无预取 → Case 3 读总线
+         ↓ mem_rdata[31:16] bits[1:0]==11 → 进入 line 615
+         ↓ !mem_la_use_prefetched_high_word → 执行 line 619 保存数据
+下一条: 被硬件解释为跨字的 32-bit 指令（需 secondword 拼接）
+```
+
+#### 子场景 B：`mem_la_use_prefetched_high_word = 1` → 跳过 line 619
+
+**数据来源**：预取缓存（mem_rdata_latched Case 1），`mem_16bit_buffer` 已持有正确的上半字。`mem_rdata` 此时是**过期/无效数据**（`mem_valid=0`，未发起总线读），绝不能覆盖 buffer。
+
+**触发条件**：上一条指令是 word 下半字的 16-bit 压缩指令，预取时将同字的上半字缓存到 `mem_16bit_buffer`（`prefetched_high_word=1`）。PC+2 后进入上半字，复用缓存，但该半字恰好 `bits[1:0]==11`。
+
+```
+上一条: 16-bit 压缩指令，位于 word_N 的下半字（PC[1:0]=00）
+         ↓ 取指时读到整个 word_N
+         ↓ mem_rdata[15:0] bits[1:0]≠11 → 压缩指令
+         ↓ mem_rdata[31:16] → 预取到 mem_16bit_buffer, prefetched_high_word=1
+         ↓ 执行完, PC += 2
+当前PC: word_N 的上半字, mem_la_use_prefetched_high_word=1 → Case 1
+         ↓ 检查 mem_16bit_buffer bits[1:0] == 11
+         ↓ 进入 line 615, 但跳过 line 619（buffer 已有数据）
+下一条: 被硬件解释为跨字 32-bit 指令
+```
+
+在合法 RISC-V 代码中此序列极少出现——压缩指令流中上半字一般也是压缩指令（`bits[1:0]≠11`）。`bits[1:0]==11` 在顺序压缩指令流中不合法，但硬件仍按编码规则处理，最终大概率落入 trap。
+
+---
+
+**总结**：line 618 保护的是 `mem_16bit_buffer` 的数据完整性。当数据来自预取缓存时已在 buffer 中，不应被可能过期的 `mem_rdata[31:16]` 覆盖。
+
+**涉及文件：**
+- [picorv32.v:613-632](picorv32.v#L613-L632) — state 1 `mem_xfer` 分支完整逻辑
+- [picorv32.v:388](picorv32.v#L388) — `mem_la_read` 第二条件（触发 secondword 的关键）
+- [picorv32.v:394-396](picorv32.v#L394-L396) — `mem_rdata_latched` 四级选择（Case 1 vs Case 3）
+
+---
+
+### 问 2（追问）：mem_la_secondword 取的是 32-bit 指令的低半还是高半？子场景 B 中 mem_valid 的真实时序？以及为什么 mem_la_use_prefetched_high_word 会 =1？
+
+**此追问纠正了此前回答中的两处错误：mem_valid 时序和指令半字方向。**
+
+#### 答 2.1：mem_la_secondword 取的是 32-bit 指令的 LOWER 16 bits
+
+依据代码 [picorv32.v:395](picorv32.v#L395)：
+
+```verilog
+COMPRESSED_ISA && mem_la_secondword ?
+    {mem_rdata_latched_noshuffle[15:0], mem_16bit_buffer}
+```
+
+`mem_16bit_buffer` 存的是第一次读从 PC 处获取的上半字（UPPER 16 bits，从 `mem_rdata[31:16]` 来），第二次读取回后拼接时被放在高 16 位。第二次读的 `[15:0]` 被放在低 16 位。所以：
+
+> **第一次取的是 UPPER 16 bits（PC 所在的半字），第二次（secondword）取的是 LOWER 16 bits。**
+
+这和"地址高低"不同——UPPER 16 bits 地址是 word_N+2（PC），LOWER 16 bits 地址是 word_{N+1}+0（更高的字对齐地址的下半部分）。
+
+#### 答 2.2：子场景 B 的 mem_valid 真实时序
+
+此前错误地描述为"mem_valid=0, 不发总线读"。实际时序如下：
+
+```
+Cycle 1: mem_state=0, mem_la_use_prefetched_high_word=1
+         mem_valid <= 0     (line 595)  ← 第一次读跳过，复用缓存
+         mem_state <= 1     (line 598)
+         mem_xfer = 1                   ← prefetch 复用条件成立
+
+Cycle 2: mem_state=1, mem_xfer=1
+         mem_la_read 第二条件成立 → 进入 line 615
+         mem_valid <= 1      (line 616) ← 第二次读发起！
+         mem_la_secondword <= 1
+```
+
+**第二次读确实通过 `mem_valid=1` 发起了真实总线读。** 子场景 A 和 B 在第二次读的行为上完全一致——都通过 `mem_valid=1` 读 word_{N+1}。区别仅在于第一次读是否经过总线。
+
+#### 答 2.3：mem_la_use_prefetched_high_word=1 的含义（再次确认）
+
+`mem_la_use_prefetched_high_word=1` 仅表示**第一次读**（PC 所在的上半字）来自预取缓存。它与第二次读的目标地址无关——`mem_16bit_buffer` 存的是当前 PC 处的上半个 halfword（来自上一次取指的预取），不是第二次读的目标数据。
+
+---
 
 ### Q9: `mem_do_prefetch` / `mem_do_rinst` / `mem_do_rdata` / `mem_do_wdata` 的含义及触发条件
 
@@ -12,7 +442,9 @@
 
 **答：**
 
-这四个信号是 PicoRV32 内存接口的**请求类型寄存器**，声明于 [picorv32.v:357-360](picorv32.v#L357-L360)，每个周期最多只有一个为 1（互斥，[picorv32.v:561-571](picorv32.v#L561-L571)）。生命周期：在各 CPU 状态中被置 1，在 `mem_done` 或 `!resetn` 时统一清零（[picorv32.v:1962-1966](picorv32.v#L1962-L1966)）。
+这四个信号是 PicoRV32 内存接口的**请求类型寄存器**，声明于 [picorv32.v:357-360](picorv32.v#L357-L360)。生命周期：在各 CPU 状态中被置 1，在 `mem_done` 或 `!resetn` 时统一清零（[picorv32.v:1962-1966](picorv32.v#L1962-L1966)）。
+
+**互斥性说明**：断言（[picorv32.v:561-571](picorv32.v#L561-L571)）检查的是写 vs 读（`wdata` vs 其他）和指令 vs 数据（`rdata` vs `prefetch`/`rinst`）的互斥。但 `mem_do_prefetch` 与 `mem_do_rinst` **可以同时为 1**——见文末追问。
 
 ---
 
@@ -137,14 +569,70 @@ mem_done 或 !resetn → 全部清零
 
 **核心设计思想**：`mem_do_prefetch` ↔ `mem_do_rinst` 之间是"**低保真预测 → 按需升级**"关系。预取在上一指令译码时就投机发出；流水线回来时若预取仍在进行，直接升级为需求取指；若已完成，数据已在 `mem_rdata_q` 中零延迟消费。Load/Store 则在这套取指流水线之外，需显式等待内存空闲。
 
+---
+
+### 问 2（追问）：`mem_do_prefetch` 和 `mem_do_rinst` 是互斥的吗？为什么断言没有检查这一点？
+
+**答：**
+
+**不是互斥的，两者可以同时为 1。** 断言（[picorv32.v:559-575](picorv32.v#L559-L575)）没有声明 `prefetch` 与 `rinst` 互斥，是**刻意为之**，而非遗漏。
+
+#### 可以同时为 1 的证据
+
+在代码中 `mem_do_rinst <= mem_do_prefetch` 这种赋值出现了 **6 次**（[1660](picorv32.v#L1660), [1734](picorv32.v#L1734), [1762](picorv32.v#L1762), [1812](picorv32.v#L1812), [1821](picorv32.v#L1821), [1846](picorv32.v#L1846)）。以 ALU 指令的快速路径为例（[picorv32.v:1659-1660](picorv32.v#L1659-L1660)）：
+
+```verilog
+// LUI/AUIPC/JAL 译码完成，即将进入 exec，且 TWO_CYCLE_ALU=0
+mem_do_rinst <= mem_do_prefetch;
+```
+
+若上一周期 `mem_do_prefetch` 被置 1（[1586](picorv32.v#L1586)）且预取尚未完成（`mem_done` 未触发），则执行此行后下一周期 `mem_do_rinst = 1, mem_do_prefetch = 1`，两者同时为 1。
+
+#### 断言检查了哪些互斥对
+
+| 断言行 | 检查内容 | 原因 |
+|:---:|---|---|
+| 561-562 | `prefetch\|rinst\|rdata` → `!wdata` | **读写互斥**：不能同时对总线读写 |
+| 564-565 | `prefetch\|rinst` → `!rdata` | **指令/数据互斥**：取指和 load 用同一套状态机，不能并存 |
+| 567-568 | `rdata` → `!prefetch && !rinst` | 同上（对称） |
+| 570-571 | `wdata` → `!`(所有读信号) | 同上（对称） |
+
+**唯独缺少**：`prefetch → !rinst` 和 `rinst → !prefetch`。
+
+#### 为什么允许同时为 1
+
+`mem_do_prefetch` 和 `mem_do_rinst` 代表的是**同一笔内存读事务的不同"认领状态"**：
+
+```
+时序:
+  cycle N:   mem_do_prefetch = 1, mem_do_rinst = 0   ← 投机预取已向总线发出
+  cycle N+1: mem_do_prefetch = 1, mem_do_rinst = 1   ← 流水线确认需要，两者共存
+  cycle N+2: mem_done → 两者同时清零                    ← 事务完成，数据被消费
+```
+
+从内存接口的视角看，它们对应的是同一笔读请求——预取阶段已经发出了 `mem_valid` 和 `mem_la_read`，`mem_do_rinst` 置 1 时**不发起新的总线请求**，只是把飞行中的事务从"投机"升级为"需求"：
+
+| 信号 | 决定的事 | 是否发起总线请求 |
+|---|---|---|
+| `mem_do_prefetch` | 提前发起一次读 | ✅ 是（state 0 → 1，`mem_valid=1`） |
+| `mem_do_rinst`（prefetch 已在进行） | 认领飞行中的读结果 | ❌ 否（复用现有请求） |
+| `mem_do_rinst`（无 prefetch） | 发起一次需求读 | ✅ 是（state 0 → 1，`mem_valid=1`） |
+
+验证：`mem_busy`（[382](picorv32.v#L382)）是简单 OR ——两者都为 1 时仍然正确；`mem_done`（[384](picorv32.v#L384)）检查的是 `mem_do_rinst` 而非 `mem_do_prefetch` —— 因为 rinst 才是"我要消费这个数据"的信号。
+
+> **一句话：`mem_do_prefetch` 和 `mem_do_rinst` 是同一笔读事务的投机态和确认态，允许叠加。断言只检查真正不能共享硬件资源的维度——读写互斥和指令/数据互斥。**
+
 **涉及文件：**
 - [picorv32.v:357-360](picorv32.v#L357-L360) — 四个信号声明
 - [picorv32.v:561-571](picorv32.v#L561-L571) — 互斥断言
 - [picorv32.v:1505-1589](picorv32.v#L1505-L1589) — `cpu_state_fetch` 中的置位逻辑
+- [picorv32.v:1660](picorv32.v#L1660) — `mem_do_rinst <= mem_do_prefetch` 关键赋值
 - [picorv32.v:1870-1915](picorv32.v#L1870-L1915) — `stmem` / `ldmem` 访存状态
 - [picorv32.v:1962-1974](picorv32.v#L1962-L1974) — 清零与 `set_mem_do_*` 触发
 
 ---
+
+## 2026-06-08
 
 ### Q8: `mem_rdata_latched` shuffle 的四种情况分别对应什么访存场景？
 

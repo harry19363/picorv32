@@ -592,7 +592,7 @@ module picorv32 #(
 				mem_wdata <= mem_la_wdata;
 			end
 			case (mem_state)
-				0: begin
+				0: begin  // idle
 					if (mem_do_prefetch || mem_do_rinst || mem_do_rdata) begin
 						mem_valid <= !mem_la_use_prefetched_high_word;
 						mem_instr <= mem_do_prefetch || mem_do_rinst;
@@ -605,12 +605,13 @@ module picorv32 #(
 						mem_state <= 2;
 					end
 				end
-				1: begin
+				1: begin  // read
 					`assert(mem_wstrb == 0);
 					`assert(mem_do_prefetch || mem_do_rinst || mem_do_rdata);
 					`assert(mem_valid == !mem_la_use_prefetched_high_word);
 					`assert(mem_instr == (mem_do_prefetch || mem_do_rinst));
 					if (mem_xfer) begin
+						// fetch the higher half of a 32-bit instr
 						if (COMPRESSED_ISA && mem_la_read) begin
 							mem_valid <= 1;
 							mem_la_secondword <= 1;
@@ -674,20 +675,20 @@ module picorv32 #(
 	reg decoder_pseudo_trigger_q;
 	reg compressed_instr;
 
-	reg is_lui_auipc_jal;
-	reg is_lb_lh_lw_lbu_lhu;
-	reg is_slli_srli_srai;
-	reg is_jalr_addi_slti_sltiu_xori_ori_andi;
-	reg is_sb_sh_sw;
-	reg is_sll_srl_sra;
-	reg is_lui_auipc_jal_jalr_addi_add_sub;
-	reg is_slti_blt_slt;
-	reg is_sltiu_bltu_sltu;
-	reg is_beq_bne_blt_bge_bltu_bgeu;
-	reg is_lbu_lhu_lw;
-	reg is_alu_reg_imm;
-	reg is_alu_reg_reg;
-	reg is_compare;
+	reg is_lui_auipc_jal;                          // upper-imm / jump-and-link (no rs1 read, straight to exec)
+	reg is_lb_lh_lw_lbu_lhu;                       // load group → ldmem
+	reg is_slli_srli_srai;                         // shift-immediate group (OP-IMM funct3=001/101)
+	reg is_jalr_addi_slti_sltiu_xori_ori_andi;     // OP-IMM minus shifts, plus JALR → straight to exec
+	reg is_sb_sh_sw;                               // store group → stmem
+	reg is_sll_srl_sra;                            // shift reg-reg group (OP funct3=001/101)
+	reg is_lui_auipc_jal_jalr_addi_add_sub;        // drives alu_add_sub MUX (add/subtract result)
+	reg is_slti_blt_slt;                           // signed comparisons → alu_lts
+	reg is_sltiu_bltu_sltu;                        // unsigned comparisons → alu_ltu
+	reg is_beq_bne_blt_bge_bltu_bgeu;              // conditional branch group (opcode==BRANCH)
+	reg is_lbu_lhu_lw;                             // zero-extend loads (excludes LB/LH) → latched_is_lu
+	reg is_alu_reg_imm;                            // OP-IMM opcode class (includes shifts)
+	reg is_alu_reg_reg;                            // OP opcode class (includes shifts)
+	reg is_compare;                                // boolean-result insns (branches + SLT*) → alu_out_0
 
 	assign instr_trap = (CATCH_ILLINSN || WITH_PCPI) && !{instr_lui, instr_auipc, instr_jal, instr_jalr,
 			instr_beq, instr_bne, instr_blt, instr_bge, instr_bltu, instr_bgeu,
@@ -890,6 +891,7 @@ module picorv32 #(
 			is_alu_reg_imm               <= mem_rdata_latched[6:0] == 7'b0010011;
 			is_alu_reg_reg               <= mem_rdata_latched[6:0] == 7'b0110011;
 
+			// long imm
 			{ decoded_imm_j[31:20], decoded_imm_j[10:1], decoded_imm_j[11], decoded_imm_j[19:12], decoded_imm_j[0] } <= $signed({mem_rdata_latched[31:12], 1'b0});
 
 			decoded_rd <= mem_rdata_latched[11:7];
@@ -899,6 +901,7 @@ module picorv32 #(
 			if (mem_rdata_latched[6:0] == 7'b0001011 && mem_rdata_latched[31:25] == 7'b0000000 && ENABLE_IRQ && ENABLE_IRQ_QREGS)
 				decoded_rs1[regindex_bits-1] <= 1; // instr_getq
 
+			// use global pointer as irq_reg if not enabled
 			if (mem_rdata_latched[6:0] == 7'b0001011 && mem_rdata_latched[31:25] == 7'b0000010 && ENABLE_IRQ)
 				decoded_rs1 <= ENABLE_IRQ_QREGS ? irqregs_offset : 3; // instr_retirq
 
@@ -909,6 +912,7 @@ module picorv32 #(
 				decoded_rs1 <= 0;
 				decoded_rs2 <= 0;
 
+				// long imm in 16-bit instr
 				{ decoded_imm_j[31:11], decoded_imm_j[4], decoded_imm_j[9:8], decoded_imm_j[10], decoded_imm_j[6],
 				  decoded_imm_j[7], decoded_imm_j[3:1], decoded_imm_j[5], decoded_imm_j[0] } <= $signed({mem_rdata_latched[12:2], 1'b0});
 
@@ -944,6 +948,7 @@ module picorv32 #(
 								decoded_rd <= 1;
 							end
 							3'b 010: begin // C.LI
+								// expand to addi rd, zero, imm
 								is_alu_reg_imm <= 1;
 								decoded_rd <= mem_rdata_latched[11:7];
 								decoded_rs1 <= 0;
