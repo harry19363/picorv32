@@ -6,6 +6,148 @@
 
 ## 2026-06-09
 
+### Q14: `decoder_trigger` 与 `decoder_pseudo_trigger` 的作用及 line 1134 清零逻辑分析
+
+**问：** `decoder_trigger` 和 `decoder_pseudo_trigger` 的作用分别是什么？在什么情况被置 0/1？影响哪些信号？对应指令执行的哪一阶段？在 [picorv32.v:1134](picorv32.v#L1134) `decoder_trigger && !decoder_pseudo_trigger` 的分支下，为什么 `is_compare` 和 `is_lui_auipc_jal_jalr_addi_add_sub` 信号会被置 0？
+
+**答：**
+
+---
+
+#### 1. 信号定义与作用
+
+两个信号均为 `reg` 类型，在状态机块（[picorv32.v:1420](picorv32.v#L1420)）中被赋值：
+
+| 信号 | 声明 | 作用 |
+|---|---|---|
+| `decoder_trigger` | [672](picorv32.v#L672) | 取指完成标志，触发 CPU 从 fetch 进入 ld_rs1，使能细粒度译码 |
+| `decoder_pseudo_trigger` | [674](picorv32.v#L674) | 复用标志，置 1 时跳过细粒度译码（line 1055），直接使用已缓存的译码结果 |
+
+---
+
+#### 2. 两级译码流水线
+
+picorv32 的译码分两级进行，分别使用不同的数据源：
+
+```
+Cycle N (mem_done):
+  ├─ 粗粒度译码 [880-899]: mem_rdata_latched → opcode 分组 (is_alu_reg_imm, is_beq_bne..., is_lb_lh_...)
+  └─ decoder_trigger <= 1 (下一拍生效)
+
+Cycle N+1 (decoder_trigger=1, decoder_pseudo_trigger=0):
+  ├─ 细粒度译码 [1055-1151]: mem_rdata_q → 具体指令 (instr_add, instr_sub, instr_lw, ...)
+  └─ cpu_state <= cpu_state_ld_rs1 (下一拍生效)
+
+Cycle N+2 (cpu_state=ld_rs1):
+  └─ 派生信号 [872-878] 从新 instr_* 重新计算 → 正确，case 分发到执行路径
+```
+
+**为什么需要两级**：粗粒度译码的数据源 `mem_rdata_latched` 是组合逻辑（`mem_xfer` 完成即可用），而细粒度译码需要 `mem_rdata_q`（需等一拍寄存器锁存）。
+
+---
+
+#### 3. 置 0/置 1 条件
+
+##### `decoder_trigger`
+
+| 位置 | 赋值 | 触发条件 | 场景 |
+|---|---|---|---|
+| [1464](picorv32.v#L1464) | `mem_do_rinst && mem_done` | 每个周期自动计算 | **正常路径**：取指完成或重置为 0 |
+| [1836](picorv32.v#L1836) | `0` | 分支成立（`alu_out_0` 为真） | 跳转目标地址变化，丢弃当前已译码指令 |
+| [1892](picorv32.v#L1892) | `1` | store 完成且无预取 (`!mem_do_prefetch && mem_done`) | store 操作结束，下条指令已提前译码 |
+| [1925](picorv32.v#L1925) | `1` | load 完成且无预取 | load 操作结束，下条指令已提前译码 |
+
+##### `decoder_pseudo_trigger`
+
+| 位置 | 赋值 | 触发条件 |
+|---|---|---|
+| [1466](picorv32.v#L1466) | `0` | **每个周期默认**（正常路径每次都做细粒度译码） |
+| [1893](picorv32.v#L1893) | `1` | store 完成转回 fetch（下条指令已在 store 等待期间完成了细粒度译码） |
+| [1926](picorv32.v#L1926) | `1` | load 完成转回 fetch（同上） |
+
+---
+
+#### 4. `decoder_pseudo_trigger` 的核心机制——并行访存期间的提前译码
+
+Load/Store 进入 `cpu_state_ldmem` / `cpu_state_stmem` 时，**同时发起下一条指令的取指**（[picorv32.v:1715-1720](picorv32.v#L1715-L1720) 中 `mem_do_rinst <= 1`）。在等待内存完成的期间：
+
+1. `mem_done` 触发 → 粗粒度译码完成
+2. `decoder_trigger <= 1` → 下一周期细粒度译码完成
+3. Load/Store 仍在等待内存
+
+当 Load/Store 最终完成时，下一条指令**已完整译码**。`decoder_pseudo_trigger <= 1` 阻止了回到 fetch 后的重复译码。
+
+```
+Load/Store 等待期间:
+  mem_do_rinst=1 → mem_done → 粗译码 → decoder_trigger=1 → 细译码 (instr_* 已更新)
+
+Load/Store 完成:
+  decoder_trigger=1, decoder_pseudo_trigger=1, cpu_state <= fetch
+  
+回到 fetch 的下一个周期:
+  decoder_trigger=1 → 进入 ld_rs1
+  decoder_pseudo_trigger=1 → 跳过 line 1055 细粒度译码 → 复用已有的 instr_*
+```
+
+**结论**：`decoder_pseudo_trigger` 实现了 picorv32 的**重叠执行优化**——利用 Load/Store 的内存等待时间并行完成下一条指令的取指和译码。
+
+---
+
+#### 5. line 1134-1135 为何将 `is_compare` 和 `is_lui_auipc_jal_jalr_addi_add_sub` 置 0
+
+##### 根本原因：同一 `always` 块内的赋值顺序
+
+在 `always @(posedge clk)` 块（line 872 起）中：
+
+```verilog
+// ① [872-878] 无条件执行 — 从当前 instr_* 派生（此时仍是旧值！）
+is_lui_auipc_jal_jalr_addi_add_sub <= |{instr_lui, instr_auipc, ...};  // 旧值
+is_compare <= |{is_beq..., instr_slti, ...};                             // 旧值
+
+// ② [1055-1151] 条件执行 — 更新 instr_* 为本次指令的值
+if (decoder_trigger && !decoder_pseudo_trigger) begin
+    instr_add <= ...;     // 新值
+    ...
+    // ③ [1134-1135] 覆盖 ① 的过期值
+    is_lui_auipc_jal_jalr_addi_add_sub <= 0;
+    is_compare <= 0;
+end
+```
+
+由于非阻塞赋值（`<=`）"最后一次赋值胜出"规则，步骤 ① 的旧值被步骤 ③ 的 `0` 覆盖。在**下一个周期**（无细粒度译码触发），步骤 ① 会从**新的** `instr_*` 重新计算出正确值——恰好是 `cpu_state_ld_rs1` 需要读取的时刻。
+
+##### 为什么只清零这两个信号？
+
+| 信号 | 使用位置 | 使用方式 | 是否清零 |
+|---|---|---|---|
+| `is_lui_auipc_jal_jalr_addi_add_sub` | [1288](picorv32.v#L1288) | **组合逻辑** ALU MUX → `alu_out = alu_add_sub` | ✅ 清零 |
+| `is_compare` | [1290](picorv32.v#L1290) | **组合逻辑** ALU MUX → `alu_out = alu_out_0` | ✅ 清零 |
+| `is_lui_auipc_jal` | [1659](picorv32.v#L1659) | **时序逻辑** — ld_rs1 的 case 分支 | ❌ 不清零 |
+| `is_slti_blt_slt` | [1279](picorv32.v#L1279) | **组合逻辑** — 仅影响 `alu_out_0` 中间值（由 `is_compare` 门控） | ❌ 不清零 |
+| `is_lbu_lhu_lw` | [1908](picorv32.v#L1908) | **时序逻辑** — ldmem 内部 | ❌ 不清零 |
+
+**核心逻辑**：`is_lui_auipc_jal_jalr_addi_add_sub` 和 `is_compare` 是**ALU 输出 MUX 的顶层 select 信号**，直接决定 `alu_out` 的组合逻辑值。如果它们携带旧指令的残留值（例如前一条指令是 ADD，当前是 XOR），ALU MUX 会在一拍内输出错误的加法结果。虽然下游时序逻辑不会锁存这个错误值（CPU 尚在 fetch 未到 exec），但组合路径上的错误值影响形式化验证和功耗分析。显式清零确保了这个一周期"气泡"中 ALU MUX 产生无害的确定性输出。
+
+其他派生信号消费于时序逻辑的 case 语句中，`cpu_state_ld_rs1` 的进入时机（细粒度译码后一拍）恰好是它们在下一个 `always` 执行中重新计算为正确值的时刻，无需人工清零。
+
+---
+
+**涉及文件：**
+- [picorv32.v:672-675](picorv32.v#L672-L675) — 信号声明
+- [picorv32.v:872-878](picorv32.v#L872-L878) — 派生信号无条件赋值（旧值来源）
+- [picorv32.v:880-899](picorv32.v#L880-L899) — 粗粒度译码
+- [picorv32.v:1055-1151](picorv32.v#L1055-L1151) — 细粒度译码
+- [picorv32.v:1134-1135](picorv32.v#L1134-L1135) — `is_compare` / `is_lui_auipc_jal_jalr_addi_add_sub` 清零
+- [picorv32.v:1285-1302](picorv32.v#L1285-L1302) — ALU 输出 MUX（清零信号的消费者）
+- [picorv32.v:1464-1467](picorv32.v#L1464-L1467) — `decoder_trigger` / `decoder_pseudo_trigger` 默认赋值
+- [picorv32.v:1575-1593](picorv32.v#L1575-L1593) — `decoder_trigger` 在 fetch 状态的消费
+- [picorv32.v:1714-1720](picorv32.v#L1714-L1720) — Load 并行取指发起点
+- [picorv32.v:1836](picorv32.v#L1836) — 分支成立时 `decoder_trigger` 清零
+- [picorv32.v:1872-1895](picorv32.v#L1872-L1895) — stmem 中 `decoder_pseudo_trigger` 置 1
+- [picorv32.v:1898-1928](picorv32.v#L1898-L1928) — ldmem 中 `decoder_pseudo_trigger` 置 1
+
+---
+
 ### Q13: C.SLLI 译码为何需要对 `decoded_rs2` 赋值？
 
 **问：** [picorv32.v:1006-1010](picorv32.v#L1006-L1010) 中 C.SLLI 指令的 case 分支，为什么要对 `decoded_rs2` 进行赋值？C.SLLI 的移位量是立即数而非寄存器，为何使用 `decoded_rs2`？
