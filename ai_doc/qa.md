@@ -6,6 +6,204 @@
 
 ## 2026-06-09
 
+### Q16: `picorv32_pcpi_div` 除法算法、舍入模式及与 GPU 软除法的 PPA 对比
+
+**问：** `picorv32_pcpi_div` 使用的除法算法是什么？舍入模式？为什么 RISC-V 需要专门的除法单元实现除法和取余，而 GPU 通常用多条指令模拟除法运算？两者的面积、延迟等 PPA 对比如何？
+
+**答：**
+
+---
+
+#### 1. 算法：Restoring Binary Long Division（恢复式二进制长除法）
+
+位于 [picorv32.v:2438-2528](picorv32.v#L2438-L2528) 的 `picorv32_pcpi_div` 模块。
+
+**初始化**（`start` 触发，[picorv32.v:2490-2496](picorv32.v#L2490-L2496)）：
+
+```
+dividend      = abs(rs1)                        // 被除数取绝对值
+divisor       = abs(rs2) << 31                  // 除数左移 31 位对齐最高商位 (63-bit reg)
+outsign       = (signed && result<0) ? 1 : 0    // DIV: sign=rs1[31]^rs2[31]; REM: sign=rs1[31]
+quotient      = 0
+quotient_msk  = 1 << 31                        // one-hot 位掩码, 逐拍右移
+```
+
+**迭代**（while `quotient_msk != 0`，[picorv32.v:2516-2525](picorv32.v#L2516-L2525)）：
+
+```verilog
+if (divisor <= dividend) begin          // shifted_divisor ≤ remainder ?
+    dividend <= dividend - divisor;      //   是: 减, 更新部分余数
+    quotient <= quotient | quotient_msk; //   是: 该商位置 1
+end
+divisor      <= divisor >> 1;           // 除数右移, 为下一比特位重新对齐
+quotient_msk <= quotient_msk >> 1;      // 移到下一商位
+```
+
+从 bit 31 到 bit 0，每拍判断"当前位权重的除数"是否 ≤ 当前余数——能减则该商位=1、更新余数；不能减则商位=0、保持余数。
+
+**结束**（[picorv32.v:2498-2514](picorv32.v#L2498-L2514)）：
+
+```
+pcpi_rd = outsign ? -quotient : quotient   // DIV/DIVU
+pcpi_rd = outsign ? -dividend : dividend   // REM/REMU (余数符号跟随被除数)
+```
+
+**延迟**：32 iterations + 2 cycles overhead = **~34 cycles**。`RISCV_FORMAL_ALTOPS` 宏定义时 `quotient_msk >>= 5`，压缩到 ~7 拍加速形式化验证。
+
+---
+
+#### 2. 舍入模式：Truncation toward Zero（向零截断）
+
+无显式舍入——二进制长除法天然产生截断结果。实现方式：操作数取绝对值按正数除法计算（向零截断等价于绝对值除法），最后根据符号规则恢复结果的符号。
+
+与 RISC-V M 扩展规范完全一致：
+- `DIV`: `quotient = trunc(rs1 / rs2)`
+- `REM`: `remainder = rs1 - rs2 × quotient`，余数符号跟随被除数
+
+---
+
+#### 3. 为何 CPU 需专用除法器而 GPU 用指令模拟
+
+##### RISC-V CPU 侧
+
+1. **ISA 强制性**：M 扩展定义 `DIV/DIVU/REM/REMU`。若不用硬件实现，需在 trap handler 中软件模拟，数百周期延迟对于实时/通用计算不可接受。
+2. **面积可控**：本除法器约 160 触发器 + 200-300 LUTs ≈ **350-500 LUTs**，通过 `ENABLE_DIV` 参数可选裁减。
+3. **顺序阻塞模型**：标量顺序核心无法隐藏长延迟，但硬件状态机 34 拍远优于软件模拟的数百条指令。
+
+##### GPU 侧
+
+1. **面积 × 并行度爆炸**：GPU SM 含数千 ALU lane。每个 300 门 × 5000 lanes = 1.5M 额外门 → 硅面积留给更多计算单元更划算。
+2. **除法极不常见**：图形着色、矩阵乘法、卷积等核心负载中除法占比 << 1%。
+3. **延迟可隐藏**：Warp 级调度在除法等待时切换到其他 warp，保证 ALU 利用率。
+4. **SIMT 不适合状态机**：per-lane 的控制流分歧与 lockstep warp 执行模型矛盾。
+5. **重用已有硬件**：已有 FP MUL/FMA，整数除法可通过 Newton-Raphson 迭代（`x_{n+1} = x_n × (2 - d × x_n)`，仅需 MUL/ADD，2-3 次迭代达 32-bit 精度）或 FP 转换近似实现。
+
+---
+
+#### 4. PPA 对比
+
+| 维度 | picorv32_pcpi_div | GPU 软除法（指令模拟） |
+|---|---|---|
+| **算法** | Restoring binary long division | Newton-Raphson 迭代 / FP 转换 |
+| **面积** | ~350-500 LUTs (~300-400 GE) | **0**（复用已有 ALU/FMA） |
+| **延迟** | ~**34 cycles** | ~**10-20 cycles**（6-10 条指令，含 MUL） |
+| **吞吐率** | 1 div / 34 cycles | 依赖指令调度，可流水线化 |
+| **延迟隐藏** | **无**（标量顺序核心阻塞） | **优秀**（warp 调度） |
+| **精度** | 精确（RISC-V spec 兼容） | 近似（依赖初始猜测/FP 精度限制） |
+| **功耗** | ~0.1-0.5 mW | 额外指令执行功耗（per-lane MUL） |
+| **设计哲学** | 通用性优先，每条 ISA 指令需合理延迟 | 吞吐量优先，硬件按摊销成本决策 |
+
+**涉及文件：**
+- [picorv32.v:2438-2528](picorv32.v#L2438-L2528) — `picorv32_pcpi_div` 模块完整实现
+- [picorv32.v:305-315](picorv32.v#L305-L315) — 除法器例化（`ENABLE_DIV` 门控）
+
+---
+
+### Q15: `mem_do_rinst && mem_done`（line 880）与 `decoder_trigger && !decoder_pseudo_trigger`（line 1055）的关系
+
+**问：** [picorv32.v:880](picorv32.v#L880) 的 `mem_do_rinst && mem_done` 和 [picorv32.v:1055](picorv32.v#L1055) 的 `decoder_trigger && !decoder_pseudo_trigger` 分别对应哪些情况，两者的关系是什么（比如是否互斥）？
+
+**答：**
+
+两个条件位于**同一个** `always @(posedge clk)` 块（line 872 起）。核心等式在另一个 always 块（line 1420 起）中：
+
+```verilog
+decoder_trigger <= mem_do_rinst && mem_done;  // line 1464
+```
+
+**`decoder_trigger` 就是 `mem_do_rinst && mem_done` 的一拍延迟寄存器**。因此两者本质上是同一事件（取指数据到达）的两个流水阶段，非互斥，为时序相邻的合作关系。
+
+---
+
+#### 1. 两阶段译码流水线
+
+```
+同一事件 "取指数据到达" 在两个周期的表现:
+
+  Cycle N:   mem_do_rinst && mem_done = 1  (当前拍组合值)
+             ├─ Line 880 fires: 粗粒度译码
+             │   数据源 = mem_rdata_latched (组合, mem_xfer 即用)
+             │   产物  = is_alu_reg_imm, is_beq_..., decoded_rd/rs1/rs2
+             └─ Line 1464 (另一always块): decoder_trigger <= 1
+
+  Cycle N+1: decoder_trigger = 1  (来自 N 拍的赋值)
+             └─ Line 1055 fires: 细粒度译码
+                 数据源 = mem_rdata_q (寄存, 需等一拍)
+                 产物  = instr_add, instr_sub, instr_lw ... (精确指令)
+  
+  Cycle N+2: Line 872-878 从新 instr_* 重新计算 is_* 派生信号
+             → 正确的值供 cpu_state_ld_rs1 消费
+```
+
+| 阶段 | 行号 | 条件 | 数据源 | 产物精度 | 触发时机 |
+|---|---|---|---|---|---|
+| 粗译码 | 880 | `mem_do_rinst && mem_done` | `mem_rdata_latched` | opcode 大类 | 取指完成当拍 |
+| 细译码 | 1055 | `decoder_trigger && !decoder_pseudo_trigger` | `mem_rdata_q` | 精确指令 | 取指完成下一拍 |
+
+---
+
+#### 2. 同一周期可能同时触发吗？
+
+**可以，但极罕见。** 条件为 `mem_do_rinst && mem_done` 在连续两个周期都为真：
+
+```
+Cycle N-1: mem_do_rinst && mem_done = 1 → decoder_trigger <= 1 (N 拍生效)
+            line 880: 指令 A 粗译码
+
+Cycle N:   decoder_trigger = 1 (来自 N-1)
+           mem_do_rinst && mem_done = 1 (又一次取指完成)
+           ├─ line 880:  指令 B 粗译码    } 同一拍
+           └─ line 1055: 指令 A 细译码    } 同时触发
+```
+
+这种背靠背取指在单端口内存接口下难以发生。唯一可能：预取缓存命中（state 3 → `&mem_state && mem_do_rinst` 立即产生 `mem_done`），紧接着下一拍另一条指令通过正常总线读取指完成。
+
+---
+
+#### 3. Load/Store 重叠执行中的特殊时序
+
+Load/Store 在等待内存期间并行发出下一条指令的取指：
+
+```
+Step 1: cpu_state_ldmem, mem_do_rinst <= 1 (并行取指, line 1715)
+Step 2: mem_done → line 880 fires (下一条指令粗译码)
+        decoder_trigger <= 1
+Step 3 (Next cycle): decoder_trigger=1, pseudo_trigger=0
+        → line 1055 fires! (下一条指令细译码, instr_* 已更新)
+Step 4: Load 完成
+        decoder_trigger <= 1, decoder_pseudo_trigger <= 1
+Step 5 (Next cycle, back in fetch):
+        decoder_trigger=1, pseudo_trigger=1
+        → line 1055 SKIPS! (pseudo_trigger 阻止重复细译码)
+        → launch_next_insn → 直接进入 ld_rs1
+```
+
+**关键**：`decoder_pseudo_trigger=1` 是 line 1055 的**负向门控**——它阻止了对已译码指令的重复细译码。如果伪触发为真，说明该指令在 Load/Store 等待期间已完成译码，无需再次做细粒度展开。
+
+---
+
+#### 4. 总结
+
+| 维度 | 说明 |
+|---|---|
+| 本质关系 | `decoder_trigger` = `mem_do_rinst && mem_done` 的寄存版本 |
+| 是否互斥 | **否** — 它们协作完成两级译码 |
+| 正常时序 | 粗译码（line 880）先 → 1 拍后细译码（line 1055） |
+| 同时触发 | 仅在背靠背取指时（罕见），服务两条不同指令 |
+| `pseudo_trigger` 角色 | 阻止 Load/Store 重叠执行后已译码指令的二次细译码 |
+
+**涉及文件：**
+- [picorv32.v:872](picorv32.v#L872) — 译码 always 块起点（两者同在此块中）
+- [picorv32.v:880-899](picorv32.v#L880-L899) — 粗粒度译码（line 880 触发者）
+- [picorv32.v:1055-1151](picorv32.v#L1055-L1151) — 细粒度译码（line 1055 触发者）
+- [picorv32.v:1420](picorv32.v#L1420) — 状态机 always 块起点
+- [picorv32.v:1464](picorv32.v#L1464) — `decoder_trigger <= mem_do_rinst && mem_done`
+- [picorv32.v:1715](picorv32.v#L1715) — Load 状态并行发起 `mem_do_rinst`
+- [picorv32.v:1892-1893](picorv32.v#L1892-L1893) — stmem 伪触发置位
+- [picorv32.v:1925-1926](picorv32.v#L1925-L1926) — ldmem 伪触发置位
+
+---
+
 ### Q14: `decoder_trigger` 与 `decoder_pseudo_trigger` 的作用及 line 1134 清零逻辑分析
 
 **问：** `decoder_trigger` 和 `decoder_pseudo_trigger` 的作用分别是什么？在什么情况被置 0/1？影响哪些信号？对应指令执行的哪一阶段？在 [picorv32.v:1134](picorv32.v#L1134) `decoder_trigger && !decoder_pseudo_trigger` 的分支下，为什么 `is_compare` 和 `is_lui_auipc_jal_jalr_addi_add_sub` 信号会被置 0？
